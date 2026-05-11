@@ -4,9 +4,10 @@ import sys
 import os
 import json
 import traceback
-
-DEFAULT_MAX_DIM = 2200
-DEFAULT_REDUCED_FACTOR = 2
+try:
+    from pyzbar.pyzbar import decode as decode_pyzbar
+except Exception:
+    decode_pyzbar = None
 
 
 def resolve_debug_folder(script_dir):
@@ -15,83 +16,63 @@ def resolve_debug_folder(script_dir):
         return os.path.abspath(configured)
 
     return os.path.abspath(
-        os.path.join(script_dir, "..", "EduAssess-Laravel", "public", "storage", "debug")
+        os.path.join(script_dir, "..", "EduAssess-Laravel", "public", "storage", "omr_processed")
     )
 
 
-def _env_int(name, default):
-    try:
-        value = int(os.getenv(name, "").strip() or default)
-        return value
-    except (TypeError, ValueError):
-        return default
+def order_points(pts):
+    rect = np.zeros((4, 2), dtype="float32")
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
+
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
+    return rect
 
 
-def _clamp_reduced_factor(value):
-    if value in (2, 4, 8):
-        return value
-    return DEFAULT_REDUCED_FACTOR
+def four_point_warp(image, pts):
+    rect = order_points(pts)
+    (tl, tr, br, bl) = rect
+
+    width_a = np.linalg.norm(br - bl)
+    width_b = np.linalg.norm(tr - tl)
+    max_width = max(int(width_a), int(width_b))
+
+    height_a = np.linalg.norm(tr - br)
+    height_b = np.linalg.norm(tl - bl)
+    max_height = max(int(height_a), int(height_b))
+
+    max_width = max(max_width, 10)
+    max_height = max(max_height, 10)
+
+    dst = np.array([
+        [0, 0],
+        [max_width - 1, 0],
+        [max_width - 1, max_height - 1],
+        [0, max_height - 1]
+    ], dtype="float32")
+
+    m = cv2.getPerspectiveTransform(rect, dst)
+    warped = cv2.warpPerspective(image, m, (max_width, max_height))
+    return warped
 
 
-def load_image_low_memory(path):
-    max_dim = _env_int("OMR_MAX_DIM", DEFAULT_MAX_DIM)
-    reduced_factor = _clamp_reduced_factor(
-        _env_int("OMR_REDUCED_FACTOR", DEFAULT_REDUCED_FACTOR)
-    )
-
-    reduced_flag = {
-        2: cv2.IMREAD_REDUCED_COLOR_2,
-        4: cv2.IMREAD_REDUCED_COLOR_4,
-        8: cv2.IMREAD_REDUCED_COLOR_8,
-    }[reduced_factor]
-
-    img = cv2.imread(path, reduced_flag)
-    if img is None:
-        img = cv2.imread(path)
-        if img is None:
-            return None
-
-    if max_dim > 0:
-        h, w = img.shape[:2]
-        largest = max(h, w)
-        if largest > max_dim:
-            scale = float(max_dim) / float(largest)
-            new_w = max(1, int(w * scale))
-            new_h = max(1, int(h * scale))
-            img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-
-    return img
-
-# ---------------- QR DETECTOR ----------------
+# ---------------- QR FALLBACK ----------------
 def decode_qr_opencv(img):
     detector = cv2.QRCodeDetector()
     data, bbox, _ = detector.detectAndDecode(img)
-    if data and data.strip():
+    if data:
         return data.strip()
-
-    # Fallback for images that contain multiple codes or weaker detections.
-    ok, decoded_infos, points, _ = detector.detectAndDecodeMulti(img)
-    if ok and decoded_infos:
-        for value in decoded_infos:
-            if value and value.strip():
-                return value.strip()
-
     return None
 
 
 # ---------------- MAIN DETECTOR ----------------
 def detect_bubble_grid(img, filename):
     try:
-        # rotate sheet
+        # keep rotation
         img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-        # preprocessing
-        blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        thresh = cv2.adaptiveThreshold(
-            blur, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-            cv2.THRESH_BINARY_INV, 21, 10
-        )
 
         # ---------------- QR DETECTION ----------------
         qr_data = None
@@ -102,56 +83,60 @@ def detect_bubble_grid(img, filename):
             int(0.02 * w):int(0.35 * w)
         ]
 
-        qr_data = decode_qr_opencv(qr_crop)
+        codes = decode_pyzbar(qr_crop) if decode_pyzbar else []
+        if codes:
+            qr_data = codes[0].data.decode("utf-8").strip()
+        else:
+            qr_data = decode_qr_opencv(qr_crop)
 
-        # ---------------- FIND GRID ----------------
-        contours, _ = cv2.findContours(
-            thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        # detect sheet boundary for perspective warp
+        edges = cv2.Canny(gray, 75, 200)
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         contours = sorted(contours, key=cv2.contourArea, reverse=True)
 
-        grid_bbox = None
+        sheet_quad = None
         for c in contours:
             peri = cv2.arcLength(c, True)
             approx = cv2.approxPolyDP(c, 0.02 * peri, True)
             if len(approx) == 4:
-                xg, yg, wg, hg = cv2.boundingRect(approx)
-                area = wg * hg
-                if area > 0.02 * gray.shape[0] * gray.shape[1]:
-                    grid_bbox = (xg, yg, wg, hg)
+                x, y, ww, hh = cv2.boundingRect(approx)
+                if ww * hh > 0.30 * w * h:
+                    sheet_quad = approx.reshape(4, 2).astype("float32")
                     break
 
-        # fallback grid
-        if grid_bbox is None:
-            h_full, w_full = gray.shape
-            xg = int(w_full * 0.08)
-            yg = int(h_full * 0.25)
-            wg = int(w_full * 0.82)
-            hg = int(h_full * 0.55)
-            grid_bbox = (xg, yg, wg, hg)
+        if sheet_quad is not None:
+            warp_img = four_point_warp(img, sheet_quad)
+        else:
+            warp_img = img.copy()
 
-        xg, yg, wg, hg = grid_bbox
-        debug_img = img.copy()
+        before_check_img = warp_img.copy()
+        warp_gray = cv2.cvtColor(warp_img, cv2.COLOR_BGR2GRAY)
 
-        # ---------------- CONFIG ----------------
+        # ---------------- GRID REGION ----------------
+        # Do not crop into a secondary answer-sheet rectangle.
+        # Run bubble detection on the full warped page.
+        h_full, w_full = warp_gray.shape
+        xg, yg, wg, hg = 0, 0, w_full, h_full
+        green_rect_img = warp_img.copy()
+        debug_img = warp_img.copy()
+
         cols = 4
         rows = 25
         choices = 5
 
         col_width = wg / cols
         row_height = hg / rows
-
         green_boxes = []
 
         # ---------------- BUBBLE DETECTION ----------------
         for col in range(cols):
-
             col_x1 = xg + int(col * col_width)
             col_x2 = xg + int((col + 1) * col_width)
             col_w = col_x2 - col_x1
 
-            col_gray = gray[yg:yg + hg, col_x1:col_x2]
-
+            col_gray = warp_gray[yg:yg + hg, col_x1:col_x2]
             approx_bubble_w = max(6, int((col_w / choices) * 0.9))
 
             def detect_bubbles(sub_gray, approx_d):
@@ -172,15 +157,13 @@ def detect_bubble_grid(img, filename):
                 candidates = []
                 for c in cnts:
                     bx, by, bw, bh = cv2.boundingRect(c)
-
                     min_d = max(4, int(approx_d * 0.5))
                     max_d = max(6, int(approx_d * 2.2))
 
                     if min_d <= bw <= max_d and min_d <= bh <= max_d and bw * bh > 10:
                         cx = bx + bw // 2
                         cy = by + bh // 2
-                        candidates.append(
-                            (cx, cy, bw, bh, bx, by, bx + bw, by + bh))
+                        candidates.append((cx, cy, bw, bh, bx, by, bx + bw, by + bh))
                 return candidates
 
             candidates = detect_bubbles(col_gray, approx_bubble_w)
@@ -193,7 +176,6 @@ def detect_bubble_grid(img, filename):
                 for (cx, cy, bw, bh, x1, y1, x2, y2) in candidates
             ]
 
-            # fallback grid boxes if detection fails
             if len(candidates_full) < rows * choices * 0.6:
                 opt_w = col_w / choices
                 for row in range(rows):
@@ -202,19 +184,15 @@ def detect_bubble_grid(img, filename):
                     for opt in range(choices):
                         ox1 = int(col_x1 + opt * opt_w)
                         ox2 = int(col_x1 + (opt + 1) * opt_w)
-                        green_boxes.append(
-                            (ox1, y1, ox2, y2, row, opt, col))
+                        green_boxes.append((ox1, y1, ox2, y2, row, opt, col))
                 continue
 
-            # group rows
             candidates_full.sort(key=lambda c: c[1])
-
             rows_groups = []
             current = [candidates_full[0]]
 
             for cand in candidates_full[1:]:
                 prev_y = np.mean([c[1] for c in current])
-
                 if abs(cand[1] - prev_y) <= max(8, row_height * 0.4):
                     current.append(cand)
                 else:
@@ -223,48 +201,37 @@ def detect_bubble_grid(img, filename):
 
             rows_groups.append(current)
 
-            # fix row count
             while len(rows_groups) > rows:
-                gaps = [(i, abs(np.mean([c[1] for c in rows_groups[i + 1]]) -
-                                np.mean([c[1] for c in rows_groups[i]])))
-                        for i in range(len(rows_groups) - 1)]
-
+                gaps = [
+                    (i, abs(np.mean([c[1] for c in rows_groups[i + 1]]) - np.mean([c[1] for c in rows_groups[i]])))
+                    for i in range(len(rows_groups) - 1)
+                ]
                 merge_idx = min(gaps, key=lambda x: x[1])[0]
                 rows_groups[merge_idx] += rows_groups.pop(merge_idx + 1)
 
             while len(rows_groups) < rows:
-                spans = [max([c[1] for c in g]) - min([c[1] for c in g])
-                         for g in rows_groups]
-
+                spans = [max([c[1] for c in g]) - min([c[1] for c in g]) for g in rows_groups]
                 idx = int(np.argmax(spans))
                 group = sorted(rows_groups.pop(idx), key=lambda c: c[0])
                 mid = len(group) // 2
                 rows_groups.insert(idx, group[:mid])
                 rows_groups.insert(idx + 1, group[mid:])
 
-            # store boxes
             for r_idx, group in enumerate(rows_groups[:rows]):
                 group_sorted = sorted(group, key=lambda c: c[0])
                 for opt_idx, sel in enumerate(group_sorted[:choices]):
                     sx1, sy1, sx2, sy2 = sel[4], sel[5], sel[6], sel[7]
-                    green_boxes.append(
-                        (sx1, sy1, sx2, sy2, r_idx, opt_idx, col))
+                    green_boxes.append((sx1, sy1, sx2, sy2, r_idx, opt_idx, col))
 
-                    cv2.rectangle(
-                        debug_img, (sx1, sy1), (sx2, sy2), (0, 255, 0), 2)
-
-        # ---------------- ANSWER SCORING ----------------
         questions_dict = {}
 
         for (sx1, sy1, sx2, sy2, r_idx, opt_idx, col) in green_boxes:
+            cv2.rectangle(green_rect_img, (sx1, sy1), (sx2, sy2), (0, 255, 0), 2)
+            cv2.rectangle(debug_img, (sx1, sy1), (sx2, sy2), (0, 255, 0), 2)
+
             q_num = r_idx + 1 + col * rows
-
-            roi = gray[sy1:sy2, sx1:sx2]
-
-            if roi.size == 0:
-                mean_intensity = 255
-            else:
-                mean_intensity = np.mean(roi)
+            roi = warp_gray[sy1:sy2, sx1:sx2]
+            mean_intensity = 255 if roi.size == 0 else np.mean(roi)
 
             questions_dict.setdefault(q_num, []).append({
                 "opt_idx": opt_idx,
@@ -275,51 +242,61 @@ def detect_bubble_grid(img, filename):
         final_answers = {}
 
         for q_num, opts in questions_dict.items():
-
-            sorted_opts = sorted(opts, key=lambda x: x["mean"])
-
-            if len(sorted_opts) < 2:
+            if len(opts) < 2:
                 final_answers[str(q_num)] = "invalid"
                 continue
 
+            sorted_opts = sorted(opts, key=lambda x: x["mean"])
             darkest = sorted_opts[0]
             second = sorted_opts[1]
-
             diff = second["mean"] - darkest["mean"]
 
-            # ---- DECISION LOGIC ----
             if diff < 15:
-                ans = "invalid"      # multiple shaded
+                ans = "invalid"
             elif darkest["mean"] > 180:
-                ans = "blank"        # nothing shaded
+                ans = "blank"
             else:
                 ans = chr(65 + darkest["opt_idx"])
-
                 sx1, sy1, sx2, sy2 = darkest["coords"]
                 cx, cy = (sx1 + sx2) // 2, (sy1 + sy2) // 2
                 cv2.circle(debug_img, (cx, cy), 7, (0, 0, 255), 2)
 
             final_answers[str(q_num)] = ans
 
-        # ---------------- DEBUG SAVE ----------------
+        # ---------------- DEBUG SAVE (EXACTLY 4 IMAGES) ----------------
         script_dir = os.path.dirname(os.path.abspath(__file__))
-
         debug_folder = resolve_debug_folder(script_dir)
-
         os.makedirs(debug_folder, exist_ok=True)
 
-        debug_filename = "debug_" + filename
-        debug_path = os.path.join(debug_folder, debug_filename)
+        name_no_ext, ext = os.path.splitext(filename)
+        if not ext:
+            ext = ".jpg"
 
-        cv2.imwrite(debug_path, debug_img)
+        files = {
+            "green_rectangles": f"{name_no_ext}_01_green_rectangles{ext}",
+            "perspective_warp": f"{name_no_ext}_02_perspective_warp{ext}",
+            "before_check_bubbles": f"{name_no_ext}_03_before_check_bubbles{ext}",
+            "after_check_bubbles": f"{name_no_ext}_04_after_check_bubbles{ext}"
+        }
 
-        relative = os.path.join("debug", debug_filename).replace("\\", "/")
+        cv2.imwrite(os.path.join(debug_folder, files["green_rectangles"]), green_rect_img)
+        cv2.imwrite(os.path.join(debug_folder, files["perspective_warp"]), warp_img)
+        cv2.imwrite(os.path.join(debug_folder, files["before_check_bubbles"]), before_check_img)
+        cv2.imwrite(os.path.join(debug_folder, files["after_check_bubbles"]), debug_img)
+
+        relative_debug = {
+            key: os.path.join("omr_processed", value).replace("\\", "/")
+            for key, value in files.items()
+        }
 
         return {
             "file": filename,
             "sheet_id": qr_data,
             "answers": final_answers,
-            "debug": relative
+            # Backward-compatible field expected by Laravel (string path).
+            "debug": relative_debug["after_check_bubbles"],
+            # Full set of debug artifacts.
+            "debug_images": relative_debug
         }
 
     except Exception as e:
@@ -327,25 +304,25 @@ def detect_bubble_grid(img, filename):
         return {"error": str(e)}
 
 
+# Backward-compatible entrypoint expected by CheckExam.py
+def analyze_bubbles(img, filename):
+    return detect_bubble_grid(img, filename)
+
+
 # ---------------- MAIN ----------------
 def main():
     try:
-        cv2.setNumThreads(1)
         if len(sys.argv) > 1:
-
             img_path = sys.argv[1]
-            img = load_image_low_memory(img_path)
+            img = cv2.imread(img_path)
 
             if img is None:
                 print(json.dumps({"error": "Cannot read image"}))
                 return
 
             filename = os.path.basename(img_path)
-
             result = detect_bubble_grid(img, filename)
-
             print(json.dumps(result))
-
         else:
             print(json.dumps({"error": "No image provided"}))
 
@@ -359,5 +336,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

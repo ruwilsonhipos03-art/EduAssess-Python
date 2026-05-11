@@ -3,3 +3,5 @@ numpy
 fastapi
 uvicorn[standard]
 python-multipart
+inference-sdk
+python-dotenv
