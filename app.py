@@ -170,3 +170,12 @@ def scan_exam(
         "exam": exam_result,
         "check_bubbles": bubble_result,
     }
+
+
+@app.post("/api/entrance/omr/check")
+def scan_exam_laravel_alias(
+    file: UploadFile = File(...),
+    x_api_key: Optional[str] = Header(default=None),
+) -> dict:
+    """Compatibility alias for Laravel/frontend route expectations."""
+    return scan_exam(file=file, x_api_key=x_api_key)
