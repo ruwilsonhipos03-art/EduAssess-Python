@@ -54,7 +54,7 @@ def resolve_output_dir(script_dir):
     if configured:
         return os.path.abspath(configured)
     return os.path.abspath(
-        os.path.join(script_dir, "..", "EduAssess-Laravel", "public", "storage", "omr_processed")
+        os.path.join(script_dir, "omr","output")
     )
 
 

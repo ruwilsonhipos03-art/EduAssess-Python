@@ -16,7 +16,7 @@ def resolve_debug_folder(script_dir):
         return os.path.abspath(configured)
 
     return os.path.abspath(
-        os.path.join(script_dir, "..", "EduAssess-Laravel", "public", "storage", "omr_processed")
+        os.path.join(script_dir, "omr","output")
     )
 
 
@@ -68,6 +68,46 @@ def decode_qr_opencv(img):
     return None
 
 
+def find_answer_grid_bbox(gray):
+    """Locate the big answer-grid rectangle in the lower part of the page."""
+    h, w = gray.shape[:2]
+
+    # Focus only on lower sheet area to avoid QR/logo/header noise.
+    y_start = int(0.28 * h)
+    lower = gray[y_start:, :]
+
+    blur = cv2.GaussianBlur(lower, (5, 5), 0)
+    edges = cv2.Canny(blur, 60, 180)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    candidates = []
+
+    for c in contours:
+        x, y, ww, hh = cv2.boundingRect(c)
+        area = ww * hh
+        if area < 0.10 * w * h:
+            continue
+        if ww < 0.60 * w:
+            continue
+        if hh < 0.35 * h:
+            continue
+        candidates.append((area, x, y + y_start, ww, hh))
+
+    if candidates:
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        _, x, y, ww, hh = candidates[0]
+        return (x, y, ww, hh)
+
+    # Fallback tuned for this answer sheet layout.
+    fx = int(0.03 * w)
+    fy = int(0.30 * h)
+    fw = int(0.94 * w)
+    fh = int(0.62 * h)
+    return (fx, fy, fw, fh)
+
+
 # ---------------- MAIN DETECTOR ----------------
 def detect_bubble_grid(img, filename):
     try:
@@ -115,10 +155,8 @@ def detect_bubble_grid(img, filename):
         warp_gray = cv2.cvtColor(warp_img, cv2.COLOR_BGR2GRAY)
 
         # ---------------- GRID REGION ----------------
-        # Do not crop into a secondary answer-sheet rectangle.
-        # Run bubble detection on the full warped page.
-        h_full, w_full = warp_gray.shape
-        xg, yg, wg, hg = 0, 0, w_full, h_full
+        # Restrict bubble scan to the answer-grid rectangle only.
+        xg, yg, wg, hg = find_answer_grid_bbox(warp_gray)
         green_rect_img = warp_img.copy()
         debug_img = warp_img.copy()
 

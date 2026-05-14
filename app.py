@@ -6,8 +6,8 @@ import cv2
 import numpy as np
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 
+from CheckBubbles import detect_bubble_grid as detect_bubbles
 from CheckExam import detect_bubble_grid as detect_exam
-from CheckTermExam import detect_bubble_grid as detect_term
 
 
 app = FastAPI(title="EduAssess OMR Service", version="1.0.0")
@@ -149,13 +149,24 @@ def scan_exam(
     x_api_key: Optional[str] = Header(default=None),
 ) -> dict:
     _require_api_key(x_api_key)
-    return _scan_uploaded_file(file, detect_exam)
+    exam_result = _scan_uploaded_file(file, detect_exam)
 
+    # Run bubble-only pass automatically after exam detection.
+    # Reconstruct image from exam output path if available, otherwise fail softly.
+    processed_path = exam_result.get("processed_path")
+    if processed_path and os.path.exists(processed_path):
+        bubble_img = cv2.imread(processed_path)
+        if bubble_img is not None:
+            bubble_result = detect_bubbles(
+                bubble_img,
+                os.path.basename(processed_path),
+            )
+        else:
+            bubble_result = {"error": "Cannot read processed image for bubble pass"}
+    else:
+        bubble_result = {"error": "No processed image path returned by exam pass"}
 
-@app.post("/scan/term")
-def scan_term(
-    file: UploadFile = File(...),
-    x_api_key: Optional[str] = Header(default=None),
-) -> dict:
-    _require_api_key(x_api_key)
-    return _scan_uploaded_file(file, detect_term)
+    return {
+        "exam": exam_result,
+        "check_bubbles": bubble_result,
+    }
