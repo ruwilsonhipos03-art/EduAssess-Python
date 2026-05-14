@@ -1,311 +1,449 @@
-﻿import cv2
-import numpy as np
-import sys
-import os
 import json
+import os
+import sys
+import tempfile
 import traceback
+
+import cv2
+import numpy as np
+
+from CheckBubbles import analyze_bubbles
+
 try:
-    from pyzbar.pyzbar import decode as decode_pyzbar
+    from inference_sdk import InferenceHTTPClient
 except Exception:
-    decode_pyzbar = None
+    InferenceHTTPClient = None
+
+try:
+    from dotenv import load_dotenv
+except Exception:
+    load_dotenv = None
+
+if load_dotenv is not None:
+    load_dotenv()
 
 
-def resolve_debug_folder(script_dir):
-    configured = (os.getenv("OMR_DEBUG_DIR") or "").strip()
+REQUIRED_CLASSES = ["top-left", "top-right", "bottom-right", "bottom-left"]
+A4_SHORT = 2480
+A4_LONG = 3508
+DEFAULT_CONFIDENCE_THRESHOLD = 0.50
+DEFAULT_LOW_CONFIDENCE_THRESHOLD = 0.20
+DEFAULT_MIN_POLYGON_AREA_RATIO = 0.08
+DEFAULT_STRONG_CORNER_CONFIDENCE = 0.60
+
+
+def _env_float(name, default):
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except Exception:
+        return default
+
+
+def _min_corner_confidence(best_by_class):
+    if not best_by_class:
+        return 0.0
+    vals = [float(v.get("confidence", 0.0)) for v in best_by_class.values()]
+    return min(vals) if vals else 0.0
+
+
+def resolve_output_dir(script_dir):
+    configured = (os.getenv("OMR_OUTPUT_DIR") or "").strip()
     if configured:
         return os.path.abspath(configured)
-
     return os.path.abspath(
-        os.path.join(script_dir, "..", "public", "storage", "debug")
+        os.path.join(script_dir, "omr","output")
     )
 
 
-# ---------------- QR FALLBACK ----------------
-def decode_qr_opencv(img):
-    detector = cv2.QRCodeDetector()
-    data, bbox, _ = detector.detectAndDecode(img)
-    if data:
-        return data.strip()
-    return None
+def select_best_predictions(predictions, threshold):
+    best = {}
+    for pred in predictions:
+        cls = (pred.get("class") or "").strip().lower().replace("_", "-")
+        conf = float(pred.get("confidence", 0))
+        if cls not in REQUIRED_CLASSES or conf < threshold:
+            continue
+        if cls not in best or conf > float(best[cls].get("confidence", 0)):
+            best[cls] = pred
+    return best
 
 
-# ---------------- MAIN DETECTOR ----------------
-def detect_bubble_grid(img, filename):
+def center_from_prediction(pred):
+    return [float(pred["x"]), float(pred["y"])]
+
+
+def order_points_clockwise(pts):
+    pts = np.array(pts, dtype=np.float32)
+    s = pts.sum(axis=1)
+    diff = np.diff(pts, axis=1).reshape(-1)
+
+    top_left = pts[np.argmin(s)]
+    bottom_right = pts[np.argmax(s)]
+    top_right = pts[np.argmin(diff)]
+    bottom_left = pts[np.argmax(diff)]
+
+    return np.array([top_left, top_right, bottom_right, bottom_left], dtype=np.float32)
+
+
+def _polygon_area(points):
+    pts = np.array(points, dtype=np.float32)
+    if pts.shape[0] < 3:
+        return 0.0
+    x = pts[:, 0]
+    y = pts[:, 1]
+    return 0.5 * abs(float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
+
+
+def _clip_point(pt, width, height):
+    x = float(np.clip(pt[0], 0, max(0, width - 1)))
+    y = float(np.clip(pt[1], 0, max(0, height - 1)))
+    return [x, y]
+
+
+def _recover_missing_corner(best_by_class, width, height):
+    keys = set(best_by_class.keys())
+    missing = [k for k in REQUIRED_CLASSES if k not in keys]
+    if len(missing) != 1:
+        return best_by_class, False
+
+    m = missing[0]
+    get = lambda k: np.array(center_from_prediction(best_by_class[k]), dtype=np.float32)
+
     try:
-        # rotate sheet
-        img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        if m == "top-left":
+            inferred = get("top-right") + get("bottom-left") - get("bottom-right")
+        elif m == "top-right":
+            inferred = get("top-left") + get("bottom-right") - get("bottom-left")
+        elif m == "bottom-right":
+            inferred = get("top-right") + get("bottom-left") - get("top-left")
+        else:  # bottom-left
+            inferred = get("top-left") + get("bottom-right") - get("top-right")
+    except Exception:
+        return best_by_class, False
 
-        # preprocessing
-        blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        thresh = cv2.adaptiveThreshold(
-            blur, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-            cv2.THRESH_BINARY_INV, 21, 10
-        )
+    clipped = _clip_point(inferred, width, height)
+    out = dict(best_by_class)
+    out[m] = {
+        "class": m,
+        "x": clipped[0],
+        "y": clipped[1],
+        "confidence": 0.0,
+        "inferred": True,
+    }
+    return out, True
 
-        # ---------------- QR DETECTION ----------------
-        qr_data = None
-        h, w = img.shape[:2]
 
-        qr_crop = img[
-            int(0.02 * h):int(0.35 * h),
-            int(0.02 * w):int(0.35 * w)
-        ]
+def validate_angle_and_get_size(ordered_pts):
+    tl, tr, br, bl = ordered_pts
+    top_w = np.linalg.norm(tr - tl)
+    bottom_w = np.linalg.norm(br - bl)
+    left_h = np.linalg.norm(bl - tl)
+    right_h = np.linalg.norm(br - tr)
 
-        codes = decode_pyzbar(qr_crop) if decode_pyzbar else []
-        if codes:
-            qr_data = codes[0].data.decode("utf-8").strip()
-        else:
-            qr_data = decode_qr_opencv(qr_crop)
+    avg_w = (top_w + bottom_w) / 2.0
+    avg_h = (left_h + right_h) / 2.0
 
-        # ---------------- FIND GRID ----------------
-        contours, _ = cv2.findContours(
-            thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-        contours = sorted(contours, key=cv2.contourArea, reverse=True)
+    if avg_h <= 1 or avg_w <= 1:
+        return (True, None, None)
 
-        grid_bbox = None
-        for c in contours:
-            peri = cv2.arcLength(c, True)
-            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-            if len(approx) == 4:
-                xg, yg, wg, hg = cv2.boundingRect(approx)
-                area = wg * hg
-                if area > 0.02 * gray.shape[0] * gray.shape[1]:
-                    grid_bbox = (xg, yg, wg, hg)
-                    break
+    detected_ratio = avg_w / avg_h
+    portrait_ratio = A4_SHORT / A4_LONG
+    landscape_ratio = A4_LONG / A4_SHORT
 
-        # fallback grid
-        if grid_bbox is None:
-            h_full, w_full = gray.shape
-            xg = int(w_full * 0.08)
-            yg = int(h_full * 0.25)
-            wg = int(w_full * 0.82)
-            hg = int(h_full * 0.55)
-            grid_bbox = (xg, yg, wg, hg)
+    portrait_error = abs(detected_ratio - portrait_ratio) / portrait_ratio
+    landscape_error = abs(detected_ratio - landscape_ratio) / landscape_ratio
 
-        xg, yg, wg, hg = grid_bbox
-        debug_img = img.copy()
+    if portrait_error <= landscape_error:
+        best_error = portrait_error
+        out_w, out_h = A4_SHORT, A4_LONG
+    else:
+        best_error = landscape_error
+        out_w, out_h = A4_LONG, A4_SHORT
 
-        # ---------------- CONFIG ----------------
-        cols = 4
-        rows = 25
-        choices = 5
+    if best_error > 0.35:
+        return (True, None, None)
 
-        col_width = wg / cols
-        row_height = hg / rows
+    return (False, out_w, out_h)
 
-        green_boxes = []
 
-        # ---------------- BUBBLE DETECTION ----------------
-        for col in range(cols):
+def draw_preview_polyline(image, ordered_pts):
+    preview = image.copy()
+    poly = ordered_pts.astype(np.int32).reshape((-1, 1, 2))
+    cv2.polylines(preview, [poly], isClosed=True, color=(0, 255, 0), thickness=6)
+    return preview
 
-            col_x1 = xg + int(col * col_width)
-            col_x2 = xg + int((col + 1) * col_width)
-            col_w = col_x2 - col_x1
 
-            col_gray = gray[yg:yg + hg, col_x1:col_x2]
+def warp_to_a4(image, ordered_pts, out_w, out_h):
+    dst = np.array(
+        [[0, 0], [out_w - 1, 0], [out_w - 1, out_h - 1], [0, out_h - 1]],
+        dtype=np.float32,
+    )
+    matrix = cv2.getPerspectiveTransform(ordered_pts, dst)
+    warped = cv2.warpPerspective(image, matrix, (out_w, out_h))
+    return warped
 
-            approx_bubble_w = max(6, int((col_w / choices) * 0.9))
 
-            def detect_bubbles(sub_gray, approx_d):
-                loc_blur = cv2.GaussianBlur(sub_gray, (5, 5), 0)
+def scanner_filter(warped_bgr):
+    gray = cv2.cvtColor(warped_bgr, cv2.COLOR_BGR2GRAY)
+    return cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        251,
+        11,
+    )
 
-                loc_thresh = cv2.adaptiveThreshold(
-                    loc_blur, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-                    cv2.THRESH_BINARY_INV, 15, 6
-                )
 
-                kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-                loc_closed = cv2.morphologyEx(
-                    loc_thresh, cv2.MORPH_CLOSE, kern, iterations=2)
+def _build_inference_variants(image):
+    variants = [image]
 
-                cnts, _ = cv2.findContours(
-                    loc_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # CLAHE-enhanced luminance
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l2 = clahe.apply(l)
+    variants.append(cv2.cvtColor(cv2.merge([l2, a, b]), cv2.COLOR_LAB2BGR))
 
-                candidates = []
-                for c in cnts:
-                    bx, by, bw, bh = cv2.boundingRect(c)
+    # mild sharpen
+    kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.float32)
+    variants.append(cv2.filter2D(image, -1, kernel))
 
-                    min_d = max(4, int(approx_d * 0.5))
-                    max_d = max(6, int(approx_d * 2.2))
+    # gamma brighten/darken variants for uneven lighting
+    for gamma in (0.85, 1.20):
+        table = np.array([((i / 255.0) ** (1.0 / gamma)) * 255 for i in np.arange(256)]).astype("uint8")
+        variants.append(cv2.LUT(image, table))
 
-                    if min_d <= bw <= max_d and min_d <= bh <= max_d and bw * bh > 10:
-                        cx = bx + bw // 2
-                        cy = by + bh // 2
-                        candidates.append(
-                            (cx, cy, bw, bh, bx, by, bx + bw, by + bh))
-                return candidates
+    return variants
 
-            candidates = detect_bubbles(col_gray, approx_bubble_w)
 
-            candidates_full = [
-                (
-                    cx + col_x1, cy + yg, bw, bh,
-                    x1 + col_x1, y1 + yg, x2 + col_x1, y2 + yg
-                )
-                for (cx, cy, bw, bh, x1, y1, x2, y2) in candidates
-            ]
+def _score_selection(best_by_class):
+    if not best_by_class:
+        return 0.0
+    return float(len(best_by_class)) * 1000.0 + sum(float(v.get("confidence", 0.0)) for v in best_by_class.values())
 
-            # fallback grid boxes if detection fails
-            if len(candidates_full) < rows * choices * 0.6:
-                opt_w = col_w / choices
-                for row in range(rows):
-                    y1 = yg + int(row * row_height)
-                    y2 = yg + int((row + 1) * row_height)
-                    for opt in range(choices):
-                        ox1 = int(col_x1 + opt * opt_w)
-                        ox2 = int(col_x1 + (opt + 1) * opt_w)
-                        green_boxes.append(
-                            (ox1, y1, ox2, y2, row, opt, col))
+
+def run_inference_best(image_path):
+    api_key = (os.getenv("ROBOFLOW_API_KEY") or "").strip()
+    model_id = (os.getenv("ROBOFLOW_MODEL_ID") or "").strip()
+
+    if not api_key or not model_id:
+        return None, {"error": "MISSING_CONFIG", "required": ["ROBOFLOW_API_KEY", "ROBOFLOW_MODEL_ID"]}
+
+    if InferenceHTTPClient is None:
+        return None, {"error": "MISSING_DEPENDENCY", "required": "inference-sdk"}
+
+    image = cv2.imread(image_path)
+    if image is None:
+        return None, {"error": "IMAGE_READ_ERROR"}
+
+    h, w = image.shape[:2]
+    primary_threshold = _env_float("OMR_CORNER_CONFIDENCE", DEFAULT_CONFIDENCE_THRESHOLD)
+    fallback_threshold = _env_float("OMR_CORNER_CONFIDENCE_FALLBACK", DEFAULT_LOW_CONFIDENCE_THRESHOLD)
+
+    client = InferenceHTTPClient(api_url="https://detect.roboflow.com", api_key=api_key)
+
+    best_global = {}
+    best_score = -1.0
+    used_threshold = primary_threshold
+    used_variant = -1
+
+    for variant_idx, variant in enumerate(_build_inference_variants(image)):
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+                temp_path = tmp.name
+            if not cv2.imwrite(temp_path, variant):
                 continue
 
-            # group rows
-            candidates_full.sort(key=lambda c: c[1])
+            result = client.infer(temp_path, model_id=model_id)
+            predictions = result.get("predictions", [])
 
-            rows_groups = []
-            current = [candidates_full[0]]
+            selected = select_best_predictions(predictions, primary_threshold)
+            threshold_used = primary_threshold
 
-            for cand in candidates_full[1:]:
-                prev_y = np.mean([c[1] for c in current])
+            if len(selected) < 4 and fallback_threshold < primary_threshold:
+                selected_fb = select_best_predictions(predictions, fallback_threshold)
+                if _score_selection(selected_fb) > _score_selection(selected):
+                    selected = selected_fb
+                    threshold_used = fallback_threshold
 
-                if abs(cand[1] - prev_y) <= max(8, row_height * 0.4):
-                    current.append(cand)
-                else:
-                    rows_groups.append(current)
-                    current = [cand]
+            score = _score_selection(selected)
+            if score > best_score:
+                best_score = score
+                best_global = selected
+                used_threshold = threshold_used
+                used_variant = variant_idx
 
-            rows_groups.append(current)
+            if len(best_global) >= 4:
+                break
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
 
-            # fix row count
-            while len(rows_groups) > rows:
-                gaps = [(i, abs(np.mean([c[1] for c in rows_groups[i + 1]]) -
-                                np.mean([c[1] for c in rows_groups[i]])))
-                        for i in range(len(rows_groups) - 1)]
+    if len(best_global) < 4:
+        recovered, recovered_ok = _recover_missing_corner(best_global, w, h)
+        if recovered_ok:
+            best_global = recovered
 
-                merge_idx = min(gaps, key=lambda x: x[1])[0]
-                rows_groups[merge_idx] += rows_groups.pop(merge_idx + 1)
-
-            while len(rows_groups) < rows:
-                spans = [max([c[1] for c in g]) - min([c[1] for c in g])
-                         for g in rows_groups]
-
-                idx = int(np.argmax(spans))
-                group = sorted(rows_groups.pop(idx), key=lambda c: c[0])
-                mid = len(group) // 2
-                rows_groups.insert(idx, group[:mid])
-                rows_groups.insert(idx + 1, group[mid:])
-
-            # store boxes
-            for r_idx, group in enumerate(rows_groups[:rows]):
-                group_sorted = sorted(group, key=lambda c: c[0])
-                for opt_idx, sel in enumerate(group_sorted[:choices]):
-                    sx1, sy1, sx2, sy2 = sel[4], sel[5], sel[6], sel[7]
-                    green_boxes.append(
-                        (sx1, sy1, sx2, sy2, r_idx, opt_idx, col))
-
-                    cv2.rectangle(
-                        debug_img, (sx1, sy1), (sx2, sy2), (0, 255, 0), 2)
-
-        # ---------------- ANSWER SCORING ----------------
-        questions_dict = {}
-
-        for (sx1, sy1, sx2, sy2, r_idx, opt_idx, col) in green_boxes:
-            q_num = r_idx + 1 + col * rows
-
-            roi = gray[sy1:sy2, sx1:sx2]
-
-            if roi.size == 0:
-                mean_intensity = 255
-            else:
-                mean_intensity = np.mean(roi)
-
-            questions_dict.setdefault(q_num, []).append({
-                "opt_idx": opt_idx,
-                "coords": (sx1, sy1, sx2, sy2),
-                "mean": mean_intensity
-            })
-
-        final_answers = {}
-
-        for q_num, opts in questions_dict.items():
-
-            sorted_opts = sorted(opts, key=lambda x: x["mean"])
-
-            darkest = sorted_opts[0]
-            second = sorted_opts[1]
-
-            diff = second["mean"] - darkest["mean"]
-
-            # ---- DECISION LOGIC ----
-            if diff < 15:
-                ans = "invalid"      # multiple shaded
-            elif darkest["mean"] > 180:
-                ans = "blank"        # nothing shaded
-            else:
-                ans = chr(65 + darkest["opt_idx"])
-
-                sx1, sy1, sx2, sy2 = darkest["coords"]
-                cx, cy = (sx1 + sx2) // 2, (sy1 + sy2) // 2
-                cv2.circle(debug_img, (cx, cy), 7, (0, 0, 255), 2)
-
-            final_answers[str(q_num)] = ans
-
-        # ---------------- DEBUG SAVE ----------------
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-
-        debug_folder = resolve_debug_folder(script_dir)
-
-        os.makedirs(debug_folder, exist_ok=True)
-
-        debug_filename = "debug_" + filename
-        debug_path = os.path.join(debug_folder, debug_filename)
-
-        cv2.imwrite(debug_path, debug_img)
-
-        relative = os.path.join("debug", debug_filename).replace("\\", "/")
-
-        return {
-            "file": filename,
-            "sheet_id": qr_data,
-            "answers": final_answers,
-            "debug": relative
+    if len(best_global) < 4:
+        return None, {
+            "error": "INCOMPLETE_DETECTION",
+            "details": {
+                "detected_classes": sorted(list(best_global.keys())),
+                "threshold_used": used_threshold,
+                "variant_used": used_variant,
+            },
         }
 
-    except Exception as e:
-        traceback.print_exc()
-        return {"error": str(e)}
+    raw_pts = [center_from_prediction(best_global[name]) for name in REQUIRED_CLASSES]
+    ordered = order_points_clockwise(raw_pts)
+
+    min_area_ratio = _env_float("OMR_MIN_POLYGON_AREA_RATIO", DEFAULT_MIN_POLYGON_AREA_RATIO)
+    strong_corner_conf = _env_float("OMR_STRONG_CORNER_CONFIDENCE", DEFAULT_STRONG_CORNER_CONFIDENCE)
+    area = _polygon_area(ordered)
+    min_conf = _min_corner_confidence(best_global)
+
+    has_inferred_corner = any(bool(v.get("inferred")) for v in best_global.values())
+
+    # Only hard-fail small polygons when detections are weak or inferred.
+    # If all 4 real corners are detected, allow processing to continue.
+    if area < float(w * h) * min_area_ratio and (has_inferred_corner or min_conf < strong_corner_conf):
+        return None, {
+            "error": "INCOMPLETE_DETECTION",
+            "details": {
+                "reason": "SMALL_POLYGON",
+                "polygon_area": area,
+                "min_area": float(w * h) * min_area_ratio,
+                "min_corner_confidence": min_conf,
+                "strong_corner_confidence": strong_corner_conf,
+                "has_inferred_corner": has_inferred_corner,
+                "variant_used": used_variant,
+            },
+        }
+
+    return {
+        "corners": best_global,
+        "threshold_used": used_threshold,
+        "variant_used": used_variant,
+        "recovered_missing": any(bool(v.get("inferred")) for v in best_global.values()),
+    }, None
 
 
-# ---------------- MAIN ----------------
+def process_document_result(image_path):
+    image = cv2.imread(image_path)
+    if image is None:
+        return {"error": "IMAGE_READ_ERROR"}
+
+    inference_pack, infer_error = run_inference_best(image_path)
+    if infer_error is not None:
+        return infer_error
+
+    best_by_class = inference_pack["corners"]
+
+    raw_pts = [center_from_prediction(best_by_class[name]) for name in REQUIRED_CLASSES]
+    ordered_pts = order_points_clockwise(raw_pts)
+
+    is_invalid, out_w, out_h = validate_angle_and_get_size(ordered_pts)
+    if is_invalid:
+        return {"error": "INVALID_ANGLE"}
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    output_dir = resolve_output_dir(script_dir)
+    os.makedirs(output_dir, exist_ok=True)
+
+    base_name = os.path.splitext(os.path.basename(image_path))[0]
+    preview_path = os.path.join(output_dir, f"{base_name}_preview.jpg")
+    warp_debug_path = os.path.join(output_dir, f"{base_name}_warp_debug.jpg")
+    processed_path = os.path.join(output_dir, f"{base_name}_processed.png")
+
+    preview = draw_preview_polyline(image, ordered_pts)
+    cv2.imwrite(preview_path, preview)
+
+    warped = warp_to_a4(image, ordered_pts, out_w, out_h)
+    cv2.imwrite(warp_debug_path, warped)
+
+    processed = scanner_filter(warped)
+    cv2.imwrite(processed_path, processed)
+
+    bubble_input = cv2.cvtColor(processed, cv2.COLOR_GRAY2BGR)
+    bubble_result = analyze_bubbles(bubble_input, os.path.basename(processed_path))
+    if "error" in bubble_result:
+        return {"error": "BUBBLE_PROCESSING_FAILED", "details": bubble_result}
+
+    corner_debug = {
+        "required_order": REQUIRED_CLASSES,
+        "raw_by_class": {
+            cls: {
+                "x": float(best_by_class[cls]["x"]),
+                "y": float(best_by_class[cls]["y"]),
+                "confidence": float(best_by_class[cls].get("confidence", 0.0)),
+                "inferred": bool(best_by_class[cls].get("inferred", False)),
+            }
+            for cls in REQUIRED_CLASSES
+        },
+        "ordered_points": {
+            "top_left": [float(ordered_pts[0][0]), float(ordered_pts[0][1])],
+            "top_right": [float(ordered_pts[1][0]), float(ordered_pts[1][1])],
+            "bottom_right": [float(ordered_pts[2][0]), float(ordered_pts[2][1])],
+            "bottom_left": [float(ordered_pts[3][0]), float(ordered_pts[3][1])],
+        },
+        "variant_used": int(inference_pack.get("variant_used", -1)),
+        "threshold_used": float(inference_pack.get("threshold_used", DEFAULT_CONFIDENCE_THRESHOLD)),
+        "recovered_missing": bool(inference_pack.get("recovered_missing", False)),
+    }
+
+    return {
+        "file": os.path.basename(image_path),
+        "processed_path": processed_path,
+        "preview_path": preview_path,
+        "warp_debug_path": warp_debug_path,
+        "bubble_preprocessed_path": bubble_result.get("preprocessed"),
+        "debug": bubble_result.get("debug"),
+        "sheet_id": bubble_result.get("sheet_id"),
+        "answers": bubble_result.get("answers", {}),
+        "corner_debug": corner_debug,
+    }
+
+
+def detect_bubble_grid(img, filename):
+    temp_path = None
+    try:
+        ext = os.path.splitext(filename or "capture.jpg")[1] or ".jpg"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+            temp_path = tmp.name
+
+        if not cv2.imwrite(temp_path, img):
+            return {"error": "IMAGE_WRITE_ERROR"}
+
+        return process_document_result(temp_path)
+    except Exception as exc:
+        return {"error": str(exc)}
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+
+
 def main():
     try:
-        if len(sys.argv) > 1:
+        if len(sys.argv) < 2:
+            print(json.dumps({"error": "NO_IMAGE_PATH"}))
+            return
 
-            img_path = sys.argv[1]
-            img = cv2.imread(img_path)
-
-            if img is None:
-                print(json.dumps({"error": "Cannot read image"}))
-                return
-
-            filename = os.path.basename(img_path)
-
-            result = detect_bubble_grid(img, filename)
-
-            print(json.dumps(result))
-
-        else:
-            print(json.dumps({"error": "No image provided"}))
-
-    except Exception as e:
-        print(json.dumps({
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }))
+        result = process_document_result(sys.argv[1])
+        print(json.dumps(result))
+    except Exception:
+        print(json.dumps({"error": "PROCESSING_FAILED", "traceback": traceback.format_exc()}))
         sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
-
