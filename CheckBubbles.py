@@ -1,375 +1,165 @@
-﻿import cv2
-import numpy as np
-import sys
-import os
 import json
-import traceback
-try:
-    from pyzbar.pyzbar import decode as decode_pyzbar
-except Exception:
-    decode_pyzbar = None
+import os
+import sys
+from typing import Dict, List
+
+import cv2
+import numpy as np
 
 
-def resolve_debug_folder(script_dir):
-    configured = (os.getenv("OMR_DEBUG_DIR") or "").strip()
-    if configured:
-        return os.path.abspath(configured)
-
-    return os.path.abspath(
-        os.path.join(script_dir, "omr","output")
-    )
+ITEMS_PER_COL = 25
+CHOICES = ["A", "B", "C", "D", "E"]
+COLS = 4
 
 
-def order_points(pts):
-    rect = np.zeros((4, 2), dtype="float32")
-    s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]
-    rect[2] = pts[np.argmax(s)]
-
-    diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]
-    rect[3] = pts[np.argmax(diff)]
-    return rect
+def _cluster_axis(values: List[float], max_gap: float) -> List[List[float]]:
+    clusters: List[List[float]] = []
+    for value in sorted(values):
+        if not clusters or value - clusters[-1][-1] > max_gap:
+            clusters.append([value])
+        else:
+            clusters[-1].append(value)
+    return clusters
 
 
-def four_point_warp(image, pts):
-    rect = order_points(pts)
-    (tl, tr, br, bl) = rect
-
-    width_a = np.linalg.norm(br - bl)
-    width_b = np.linalg.norm(tr - tl)
-    max_width = max(int(width_a), int(width_b))
-
-    height_a = np.linalg.norm(tr - br)
-    height_b = np.linalg.norm(tl - bl)
-    max_height = max(int(height_a), int(height_b))
-
-    max_width = max(max_width, 10)
-    max_height = max(max_height, 10)
-
-    dst = np.array([
-        [0, 0],
-        [max_width - 1, 0],
-        [max_width - 1, max_height - 1],
-        [0, max_height - 1]
-    ], dtype="float32")
-
-    m = cv2.getPerspectiveTransform(rect, dst)
-    warped = cv2.warpPerspective(image, m, (max_width, max_height))
-    return warped
+def _center(cluster: List[float]) -> float:
+    return float(np.mean(cluster))
 
 
-# ---------------- QR FALLBACK ----------------
-def decode_qr_opencv(img):
-    detector = cv2.QRCodeDetector()
-    data, bbox, _ = detector.detectAndDecode(img)
-    if data:
-        return data.strip()
-    return None
+def _ratio_in_circle(thresh_roi: np.ndarray, cx: float, cy: float, radius: int) -> float:
+    mask = np.zeros(thresh_roi.shape, dtype="uint8")
+    cv2.circle(mask, (int(round(cx)), int(round(cy))), radius, 255, -1)
+    total_pixels = np.sum(mask == 255)
+    if total_pixels == 0:
+        return 0.0
+    return float(np.sum((thresh_roi == 255) & (mask == 255)) / total_pixels)
 
 
-def find_answer_grid_bbox(gray):
-    """Locate the big answer-grid rectangle in the lower part of the page."""
-    h, w = gray.shape[:2]
+def detect_bubble_grid(thresh_roi: np.ndarray, filename: str) -> Dict:
+    """
+    Analyzes the Image 03 binary matrix by learning the printed OMR grid.
+    The final read uses expected row/choice centers, so a weak or broken
+    bubble contour does not make the whole row invalid.
+    """
+    if len(thresh_roi.shape) == 3:
+        thresh_roi = cv2.cvtColor(thresh_roi, cv2.COLOR_BGR2GRAY)
 
-    # Focus only on lower sheet area to avoid QR/logo/header noise.
-    y_start = int(0.28 * h)
-    lower = gray[y_start:, :]
+    contours, hierarchy = cv2.findContours(thresh_roi.copy(), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    if hierarchy is None:
+        return {"error": "No structural contours detected in bubble workspace."}
 
-    blur = cv2.GaussianBlur(lower, (5, 5), 0)
-    edges = cv2.Canny(blur, 60, 180)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
-
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    candidates = []
+    valid_bubbles = []
+    min_area, max_area = 50, 600
 
     for c in contours:
-        x, y, ww, hh = cv2.boundingRect(c)
-        area = ww * hh
-        if area < 0.10 * w * h:
+        x, y, w, h = cv2.boundingRect(c)
+        if h == 0:
             continue
-        if ww < 0.60 * w:
-            continue
-        if hh < 0.35 * h:
-            continue
-        candidates.append((area, x, y + y_start, ww, hh))
 
-    if candidates:
-        candidates.sort(key=lambda item: item[0], reverse=True)
-        _, x, y, ww, hh = candidates[0]
-        return (x, y, ww, hh)
+        aspect_ratio = w / float(h)
+        area = cv2.contourArea(c)
 
-    # Fallback tuned for this answer sheet layout.
-    fx = int(0.03 * w)
-    fy = int(0.30 * h)
-    fw = int(0.94 * w)
-    fh = int(0.62 * h)
-    return (fx, fy, fw, fh)
+        if min_area < area < max_area and 0.70 <= aspect_ratio <= 1.40:
+            M = cv2.moments(c)
+            if M["m00"] != 0:
+                valid_bubbles.append({
+                    "cx": int(M["m10"] / M["m00"]),
+                    "cy": int(M["m01"] / M["m00"]),
+                    "w": w,
+                    "h": h,
+                })
 
+    if len(valid_bubbles) < 300:
+        return {"error": f"Dynamic layout sorting failed. Found only {len(valid_bubbles)} candidate circles."}
 
-# ---------------- MAIN DETECTOR ----------------
-def detect_bubble_grid(img, filename):
-    try:
-        # keep rotation
-        img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+    avg_radius = int(np.median([max(b["w"], b["h"]) / 2 for b in valid_bubbles]))
+    avg_radius = max(5, avg_radius)
 
-        # ---------------- QR DETECTION ----------------
-        qr_data = None
-        h, w = img.shape[:2]
+    x_clusters = _cluster_axis([b["cx"] for b in valid_bubbles], max(avg_radius * 1.6, 16))
+    min_track_hits = max(10, int(ITEMS_PER_COL * 0.65))
+    x_tracks = [_center(cluster) for cluster in x_clusters if len(cluster) >= min_track_hits]
 
-        qr_crop = img[
-            int(0.02 * h):int(0.35 * h),
-            int(0.02 * w):int(0.35 * w)
-        ]
+    if len(x_tracks) < COLS * len(CHOICES):
+        min_track_hits = max(6, int(ITEMS_PER_COL * 0.45))
+        x_tracks = [_center(cluster) for cluster in x_clusters if len(cluster) >= min_track_hits]
 
-        codes = decode_pyzbar(qr_crop) if decode_pyzbar else []
-        if codes:
-            qr_data = codes[0].data.decode("utf-8").strip()
-        else:
-            qr_data = decode_qr_opencv(qr_crop)
+    x_tracks = sorted(x_tracks)[: COLS * len(CHOICES)]
+    if len(x_tracks) != COLS * len(CHOICES):
+        return {"error": f"Expected 20 answer tracks but found {len(x_tracks)}."}
 
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    final_answers = {}
+    bubble_telemetry = []
+    fill_radius = max(3, int(avg_radius * 0.62))
 
-        # detect sheet boundary for perspective warp
-        edges = cv2.Canny(gray, 75, 200)
-        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        contours = sorted(contours, key=cv2.contourArea, reverse=True)
+    for col_idx in range(COLS):
+        col_x_tracks = x_tracks[col_idx * len(CHOICES) : (col_idx + 1) * len(CHOICES)]
+        left_bound = min(col_x_tracks) - (avg_radius * 1.8)
+        right_bound = max(col_x_tracks) + (avg_radius * 1.8)
+        col_points = [b for b in valid_bubbles if left_bound <= b["cx"] <= right_bound]
 
-        sheet_quad = None
-        for c in contours:
-            peri = cv2.arcLength(c, True)
-            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-            if len(approx) == 4:
-                x, y, ww, hh = cv2.boundingRect(approx)
-                if ww * hh > 0.30 * w * h:
-                    sheet_quad = approx.reshape(4, 2).astype("float32")
-                    break
+        y_clusters = _cluster_axis([b["cy"] for b in col_points], max(avg_radius * 1.35, 14))
+        y_tracks = [_center(cluster) for cluster in y_clusters if len(cluster) >= 3]
+        y_tracks = sorted(y_tracks)[:ITEMS_PER_COL]
 
-        if sheet_quad is not None:
-            warp_img = four_point_warp(img, sheet_quad)
-        else:
-            warp_img = img.copy()
+        if len(y_tracks) < ITEMS_PER_COL:
+            return {"error": f"Expected 25 rows in column {col_idx + 1} but found {len(y_tracks)}."}
 
-        before_check_img = warp_img.copy()
-        warp_gray = cv2.cvtColor(warp_img, cv2.COLOR_BGR2GRAY)
+        for row_idx, row_y in enumerate(y_tracks):
+            item_num = row_idx + 1 + (col_idx * ITEMS_PER_COL)
+            key = str(item_num)
 
-        # ---------------- GRID REGION ----------------
-        # Restrict bubble scan to the answer-grid rectangle only.
-        xg, yg, wg, hg = find_answer_grid_bbox(warp_gray)
-        green_rect_img = warp_img.copy()
-        debug_img = warp_img.copy()
-
-        cols = 4
-        rows = 25
-        choices = 5
-
-        col_width = wg / cols
-        row_height = hg / rows
-        green_boxes = []
-
-        # ---------------- BUBBLE DETECTION ----------------
-        for col in range(cols):
-            col_x1 = xg + int(col * col_width)
-            col_x2 = xg + int((col + 1) * col_width)
-            col_w = col_x2 - col_x1
-
-            col_gray = warp_gray[yg:yg + hg, col_x1:col_x2]
-            approx_bubble_w = max(6, int((col_w / choices) * 0.9))
-
-            def detect_bubbles(sub_gray, approx_d):
-                loc_blur = cv2.GaussianBlur(sub_gray, (5, 5), 0)
-
-                loc_thresh = cv2.adaptiveThreshold(
-                    loc_blur, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-                    cv2.THRESH_BINARY_INV, 15, 6
-                )
-
-                kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-                loc_closed = cv2.morphologyEx(
-                    loc_thresh, cv2.MORPH_CLOSE, kern, iterations=2)
-
-                cnts, _ = cv2.findContours(
-                    loc_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-                candidates = []
-                for c in cnts:
-                    bx, by, bw, bh = cv2.boundingRect(c)
-                    min_d = max(4, int(approx_d * 0.5))
-                    max_d = max(6, int(approx_d * 2.2))
-
-                    if min_d <= bw <= max_d and min_d <= bh <= max_d and bw * bh > 10:
-                        cx = bx + bw // 2
-                        cy = by + bh // 2
-                        candidates.append((cx, cy, bw, bh, bx, by, bx + bw, by + bh))
-                return candidates
-
-            candidates = detect_bubbles(col_gray, approx_bubble_w)
-
-            candidates_full = [
-                (
-                    cx + col_x1, cy + yg, bw, bh,
-                    x1 + col_x1, y1 + yg, x2 + col_x1, y2 + yg
-                )
-                for (cx, cy, bw, bh, x1, y1, x2, y2) in candidates
+            ratios = [
+                _ratio_in_circle(thresh_roi, choice_x, row_y, fill_radius)
+                for choice_x in col_x_tracks
             ]
+            ordered = sorted(ratios, reverse=True)
+            strongest = ordered[0]
+            runner_up = ordered[1] if len(ordered) > 1 else 0.0
 
-            if len(candidates_full) < rows * choices * 0.6:
-                opt_w = col_w / choices
-                for row in range(rows):
-                    y1 = yg + int(row * row_height)
-                    y2 = yg + int((row + 1) * row_height)
-                    for opt in range(choices):
-                        ox1 = int(col_x1 + opt * opt_w)
-                        ox2 = int(col_x1 + (opt + 1) * opt_w)
-                        green_boxes.append((ox1, y1, ox2, y2, row, opt, col))
-                continue
+            detected_filled_for_row = []
+            row_telemetry_cache = []
 
-            candidates_full.sort(key=lambda c: c[1])
-            rows_groups = []
-            current = [candidates_full[0]]
+            for choice_idx, (choice_x, fill_ratio) in enumerate(zip(col_x_tracks, ratios)):
+                is_filled = False
+                if strongest >= 0.68:
+                    if fill_ratio == strongest and strongest >= runner_up + 0.10:
+                        is_filled = True
+                    elif fill_ratio >= 0.68 and fill_ratio >= strongest - 0.03:
+                        is_filled = True
 
-            for cand in candidates_full[1:]:
-                prev_y = np.mean([c[1] for c in current])
-                if abs(cand[1] - prev_y) <= max(8, row_height * 0.4):
-                    current.append(cand)
-                else:
-                    rows_groups.append(current)
-                    current = [cand]
+                row_telemetry_cache.append(((int(round(choice_x)), int(round(row_y))), is_filled, key))
+                if is_filled:
+                    detected_filled_for_row.append(CHOICES[choice_idx])
 
-            rows_groups.append(current)
+            bubble_telemetry.extend(row_telemetry_cache)
 
-            while len(rows_groups) > rows:
-                gaps = [
-                    (i, abs(np.mean([c[1] for c in rows_groups[i + 1]]) - np.mean([c[1] for c in rows_groups[i]])))
-                    for i in range(len(rows_groups) - 1)
-                ]
-                merge_idx = min(gaps, key=lambda x: x[1])[0]
-                rows_groups[merge_idx] += rows_groups.pop(merge_idx + 1)
-
-            while len(rows_groups) < rows:
-                spans = [max([c[1] for c in g]) - min([c[1] for c in g]) for g in rows_groups]
-                idx = int(np.argmax(spans))
-                group = sorted(rows_groups.pop(idx), key=lambda c: c[0])
-                mid = len(group) // 2
-                rows_groups.insert(idx, group[:mid])
-                rows_groups.insert(idx + 1, group[mid:])
-
-            for r_idx, group in enumerate(rows_groups[:rows]):
-                group_sorted = sorted(group, key=lambda c: c[0])
-                for opt_idx, sel in enumerate(group_sorted[:choices]):
-                    sx1, sy1, sx2, sy2 = sel[4], sel[5], sel[6], sel[7]
-                    green_boxes.append((sx1, sy1, sx2, sy2, r_idx, opt_idx, col))
-
-        questions_dict = {}
-
-        for (sx1, sy1, sx2, sy2, r_idx, opt_idx, col) in green_boxes:
-            cv2.rectangle(green_rect_img, (sx1, sy1), (sx2, sy2), (0, 255, 0), 2)
-            cv2.rectangle(debug_img, (sx1, sy1), (sx2, sy2), (0, 255, 0), 2)
-
-            q_num = r_idx + 1 + col * rows
-            roi = warp_gray[sy1:sy2, sx1:sx2]
-            mean_intensity = 255 if roi.size == 0 else np.mean(roi)
-
-            questions_dict.setdefault(q_num, []).append({
-                "opt_idx": opt_idx,
-                "coords": (sx1, sy1, sx2, sy2),
-                "mean": mean_intensity
-            })
-
-        final_answers = {}
-
-        for q_num, opts in questions_dict.items():
-            if len(opts) < 2:
-                final_answers[str(q_num)] = "invalid"
-                continue
-
-            sorted_opts = sorted(opts, key=lambda x: x["mean"])
-            darkest = sorted_opts[0]
-            second = sorted_opts[1]
-            diff = second["mean"] - darkest["mean"]
-
-            if diff < 15:
-                ans = "invalid"
-            elif darkest["mean"] > 180:
-                ans = "blank"
+            if len(detected_filled_for_row) == 1:
+                final_answers[key] = detected_filled_for_row[0]
+            elif len(detected_filled_for_row) > 1:
+                final_answers[key] = "multimark"
             else:
-                ans = chr(65 + darkest["opt_idx"])
-                sx1, sy1, sx2, sy2 = darkest["coords"]
-                cx, cy = (sx1 + sx2) // 2, (sy1 + sy2) // 2
-                cv2.circle(debug_img, (cx, cy), 7, (0, 0, 255), 2)
+                final_answers[key] = "blank"
 
-            final_answers[str(q_num)] = ans
-
-        # ---------------- DEBUG SAVE (EXACTLY 4 IMAGES) ----------------
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        debug_folder = resolve_debug_folder(script_dir)
-        os.makedirs(debug_folder, exist_ok=True)
-
-        name_no_ext, ext = os.path.splitext(filename)
-        if not ext:
-            ext = ".jpg"
-
-        files = {
-            "green_rectangles": f"{name_no_ext}_01_green_rectangles{ext}",
-            "perspective_warp": f"{name_no_ext}_02_perspective_warp{ext}",
-            "before_check_bubbles": f"{name_no_ext}_03_before_check_bubbles{ext}",
-            "after_check_bubbles": f"{name_no_ext}_04_after_check_bubbles{ext}"
-        }
-
-        cv2.imwrite(os.path.join(debug_folder, files["green_rectangles"]), green_rect_img)
-        cv2.imwrite(os.path.join(debug_folder, files["perspective_warp"]), warp_img)
-        cv2.imwrite(os.path.join(debug_folder, files["before_check_bubbles"]), before_check_img)
-        cv2.imwrite(os.path.join(debug_folder, files["after_check_bubbles"]), debug_img)
-
-        relative_debug = {
-            key: os.path.join("omr_processed", value).replace("\\", "/")
-            for key, value in files.items()
-        }
-
-        return {
-            "file": filename,
-            "sheet_id": qr_data,
-            "answers": final_answers,
-            # Backward-compatible field expected by Laravel (string path).
-            "debug": relative_debug["after_check_bubbles"],
-            # Full set of debug artifacts.
-            "debug_images": relative_debug
-        }
-
-    except Exception as e:
-        traceback.print_exc()
-        return {"error": str(e)}
+    return {
+        "answers": final_answers,
+        "bubble_centers": bubble_telemetry,
+        "calculated_radius": avg_radius,
+    }
 
 
-# Backward-compatible entrypoint expected by CheckExam.py
-def analyze_bubbles(img, filename):
-    return detect_bubble_grid(img, filename)
+def analyze_bubbles(thresh_roi: np.ndarray, filename: str) -> Dict:
+    return detect_bubble_grid(thresh_roi, filename)
 
 
-# ---------------- MAIN ----------------
 def main():
-    try:
-        if len(sys.argv) > 1:
-            img_path = sys.argv[1]
-            img = cv2.imread(img_path)
-
-            if img is None:
-                print(json.dumps({"error": "Cannot read image"}))
-                return
-
-            filename = os.path.basename(img_path)
-            result = detect_bubble_grid(img, filename)
-            print(json.dumps(result))
-        else:
-            print(json.dumps({"error": "No image provided"}))
-
-    except Exception as e:
-        print(json.dumps({
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }))
-        sys.exit(1)
+    if len(sys.argv) < 2:
+        print(json.dumps({"error": "NO_IMAGE_PATH"}))
+        return
+    img = cv2.imread(sys.argv[1], cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        print(json.dumps({"error": "IMAGE_READ_ERROR"}))
+        return
+    print(json.dumps(detect_bubble_grid(img, os.path.basename(sys.argv[1]))))
 
 
 if __name__ == "__main__":

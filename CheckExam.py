@@ -3,16 +3,21 @@ import os
 import sys
 import tempfile
 import traceback
+from typing import Dict, Tuple
 
 import cv2
 import numpy as np
 
-from CheckBubbles import analyze_bubbles
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+if CURRENT_DIR not in sys.path:
+    sys.path.insert(0, CURRENT_DIR)
+
+import CheckBubbles
 
 try:
-    from inference_sdk import InferenceHTTPClient
+    from pyzbar.pyzbar import decode as decode_qr
 except Exception:
-    InferenceHTTPClient = None
+    decode_qr = None
 
 try:
     from dotenv import load_dotenv
@@ -23,407 +28,264 @@ if load_dotenv is not None:
     load_dotenv()
 
 
-REQUIRED_CLASSES = ["top-left", "top-right", "bottom-right", "bottom-left"]
-A4_SHORT = 2480
-A4_LONG = 3508
-DEFAULT_CONFIDENCE_THRESHOLD = 0.50
-DEFAULT_LOW_CONFIDENCE_THRESHOLD = 0.20
-DEFAULT_MIN_POLYGON_AREA_RATIO = 0.08
-DEFAULT_STRONG_CORNER_CONFIDENCE = 0.60
+def order_points(points: np.ndarray) -> np.ndarray:
+    pts = np.array(points, dtype=np.float32)
+    rect = np.zeros((4, 2), dtype=np.float32)
+    sums = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(sums)]  # Top-Left
+    rect[2] = pts[np.argmax(sums)]  # Bottom-Right
+    diffs = np.diff(pts, axis=1).reshape(-1)
+    rect[1] = pts[np.argmin(diffs)]  # Top-Right
+    rect[3] = pts[np.argmax(diffs)]  # Bottom-Left
+    return rect
 
 
-def _env_float(name, default):
-    raw = (os.getenv(name) or "").strip()
-    if not raw:
-        return default
-    try:
-        return float(raw)
-    except Exception:
-        return default
+def warp_sheet_to_landscape(image: np.ndarray) -> Tuple[np.ndarray, Dict]:
+    landscape_size = (1553, 1200)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edged = cv2.Canny(blur, 50, 150)
+
+    contours, _ = cv2.findContours(edged.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+
+    warped = cv2.resize(image, landscape_size)
+    debug_meta = {"method": "fallback_scale", "page_corners": None}
+
+    for c in contours:
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+        if len(approx) == 4:
+            quad = approx.reshape(4, 2)
+            rect = order_points(quad)
+            
+            dst = np.array([
+                [0, 0],
+                [landscape_size[0] - 1, 0],
+                [landscape_size[0] - 1, landscape_size[1] - 1],
+                [0, landscape_size[1] - 1]
+            ], dtype=np.float32)
+            
+            matrix = cv2.getPerspectiveTransform(rect, dst)
+            warped = cv2.warpPerspective(image, matrix, landscape_size)
+            debug_meta = {
+                "method": "largest_page_contour",
+                "page_corners": rect.tolist(),
+            }
+            break
+    return warped, debug_meta
 
 
-def _min_corner_confidence(best_by_class):
-    if not best_by_class:
-        return 0.0
-    vals = [float(v.get("confidence", 0.0)) for v in best_by_class.values()]
-    return min(vals) if vals else 0.0
-
-
-def resolve_output_dir(script_dir):
+def resolve_output_dir() -> str:
     configured = (os.getenv("OMR_OUTPUT_DIR") or "").strip()
     if configured:
         return os.path.abspath(configured)
-    return os.path.abspath(
-        os.path.join(script_dir, "omr","output")
-    )
+    return os.path.abspath(os.path.join(CURRENT_DIR, "output"))
 
 
-def select_best_predictions(predictions, threshold):
-    best = {}
-    for pred in predictions:
-        cls = (pred.get("class") or "").strip().lower().replace("_", "-")
-        conf = float(pred.get("confidence", 0))
-        if cls not in REQUIRED_CLASSES or conf < threshold:
-            continue
-        if cls not in best or conf > float(best[cls].get("confidence", 0)):
-            best[cls] = pred
-    return best
-
-
-def center_from_prediction(pred):
-    return [float(pred["x"]), float(pred["y"])]
-
-
-def order_points_clockwise(pts):
-    pts = np.array(pts, dtype=np.float32)
-    s = pts.sum(axis=1)
-    diff = np.diff(pts, axis=1).reshape(-1)
-
-    top_left = pts[np.argmin(s)]
-    bottom_right = pts[np.argmax(s)]
-    top_right = pts[np.argmin(diff)]
-    bottom_left = pts[np.argmax(diff)]
-
-    return np.array([top_left, top_right, bottom_right, bottom_left], dtype=np.float32)
-
-
-def _polygon_area(points):
-    pts = np.array(points, dtype=np.float32)
-    if pts.shape[0] < 3:
-        return 0.0
-    x = pts[:, 0]
-    y = pts[:, 1]
-    return 0.5 * abs(float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
-
-
-def _clip_point(pt, width, height):
-    x = float(np.clip(pt[0], 0, max(0, width - 1)))
-    y = float(np.clip(pt[1], 0, max(0, height - 1)))
-    return [x, y]
-
-
-def _recover_missing_corner(best_by_class, width, height):
-    keys = set(best_by_class.keys())
-    missing = [k for k in REQUIRED_CLASSES if k not in keys]
-    if len(missing) != 1:
-        return best_by_class, False
-
-    m = missing[0]
-    get = lambda k: np.array(center_from_prediction(best_by_class[k]), dtype=np.float32)
-
+def _public_path(path: str, output_dir: str) -> str:
+    public_prefix = (os.getenv("OMR_PUBLIC_DEBUG_PREFIX") or "omr_processed").strip("/")
     try:
-        if m == "top-left":
-            inferred = get("top-right") + get("bottom-left") - get("bottom-right")
-        elif m == "top-right":
-            inferred = get("top-left") + get("bottom-right") - get("bottom-left")
-        elif m == "bottom-right":
-            inferred = get("top-right") + get("bottom-left") - get("top-left")
-        else:  # bottom-left
-            inferred = get("top-left") + get("bottom-right") - get("top-right")
+        rel = os.path.relpath(path, output_dir)
+    except ValueError:
+        rel = os.path.basename(path)
+    return f"{public_prefix}/{rel.replace(os.sep, '/')}"
+
+
+def _decode_qr_with_pyzbar(image: np.ndarray) -> str:
+    if not decode_qr:
+        return ""
+    try:
+        decoded = decode_qr(image)
     except Exception:
-        return best_by_class, False
-
-    clipped = _clip_point(inferred, width, height)
-    out = dict(best_by_class)
-    out[m] = {
-        "class": m,
-        "x": clipped[0],
-        "y": clipped[1],
-        "confidence": 0.0,
-        "inferred": True,
-    }
-    return out, True
+        return ""
+    if not decoded:
+        return ""
+    return decoded[0].data.decode("utf-8", errors="ignore").strip()
 
 
-def validate_angle_and_get_size(ordered_pts):
-    tl, tr, br, bl = ordered_pts
-    top_w = np.linalg.norm(tr - tl)
-    bottom_w = np.linalg.norm(br - bl)
-    left_h = np.linalg.norm(bl - tl)
-    right_h = np.linalg.norm(br - tr)
-
-    avg_w = (top_w + bottom_w) / 2.0
-    avg_h = (left_h + right_h) / 2.0
-
-    if avg_h <= 1 or avg_w <= 1:
-        return (True, None, None)
-
-    detected_ratio = avg_w / avg_h
-    portrait_ratio = A4_SHORT / A4_LONG
-    landscape_ratio = A4_LONG / A4_SHORT
-
-    portrait_error = abs(detected_ratio - portrait_ratio) / portrait_ratio
-    landscape_error = abs(detected_ratio - landscape_ratio) / landscape_ratio
-
-    if portrait_error <= landscape_error:
-        best_error = portrait_error
-        out_w, out_h = A4_SHORT, A4_LONG
-    else:
-        best_error = landscape_error
-        out_w, out_h = A4_LONG, A4_SHORT
-
-    if best_error > 0.35:
-        return (True, None, None)
-
-    return (False, out_w, out_h)
+def _decode_qr_with_opencv(image: np.ndarray) -> str:
+    try:
+        detector = cv2.QRCodeDetector()
+        data, _, _ = detector.detectAndDecode(image)
+    except Exception:
+        return ""
+    return (data or "").strip()
 
 
-def draw_preview_polyline(image, ordered_pts):
-    preview = image.copy()
-    poly = ordered_pts.astype(np.int32).reshape((-1, 1, 2))
-    cv2.polylines(preview, [poly], isClosed=True, color=(0, 255, 0), thickness=6)
-    return preview
+def _qr_variants(image: np.ndarray) -> list[np.ndarray]:
+    variants = []
+    base = image
+    if len(base.shape) == 2:
+        base = cv2.cvtColor(base, cv2.COLOR_GRAY2BGR)
 
+    variants.append(base)
+    gray = cv2.cvtColor(base, cv2.COLOR_BGR2GRAY)
+    variants.append(gray)
 
-def warp_to_a4(image, ordered_pts, out_w, out_h):
-    dst = np.array(
-        [[0, 0], [out_w - 1, 0], [out_w - 1, out_h - 1], [0, out_h - 1]],
-        dtype=np.float32,
-    )
-    matrix = cv2.getPerspectiveTransform(ordered_pts, dst)
-    warped = cv2.warpPerspective(image, matrix, (out_w, out_h))
-    return warped
+    for scale in (2.0, 3.0):
+        resized = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        variants.append(resized)
+        variants.append(cv2.copyMakeBorder(resized, 24, 24, 24, 24, cv2.BORDER_CONSTANT, value=255))
 
-
-def scanner_filter(warped_bgr):
-    gray = cv2.cvtColor(warped_bgr, cv2.COLOR_BGR2GRAY)
-    return cv2.adaptiveThreshold(
-        gray,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        251,
-        11,
-    )
-
-
-def _build_inference_variants(image):
-    variants = [image]
-
-    # CLAHE-enhanced luminance
-    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    l2 = clahe.apply(l)
-    variants.append(cv2.cvtColor(cv2.merge([l2, a, b]), cv2.COLOR_LAB2BGR))
-
-    # mild sharpen
-    kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.float32)
-    variants.append(cv2.filter2D(image, -1, kernel))
-
-    # gamma brighten/darken variants for uneven lighting
-    for gamma in (0.85, 1.20):
-        table = np.array([((i / 255.0) ** (1.0 / gamma)) * 255 for i in np.arange(256)]).astype("uint8")
-        variants.append(cv2.LUT(image, table))
-
+    thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+    variants.append(thresh)
+    variants.append(cv2.copyMakeBorder(thresh, 16, 16, 16, 16, cv2.BORDER_CONSTANT, value=255))
     return variants
 
 
-def _score_selection(best_by_class):
-    if not best_by_class:
-        return 0.0
-    return float(len(best_by_class)) * 1000.0 + sum(float(v.get("confidence", 0.0)) for v in best_by_class.values())
-
-
-def run_inference_best(image_path):
-    api_key = (os.getenv("ROBOFLOW_API_KEY") or "").strip()
-    model_id = (os.getenv("ROBOFLOW_MODEL_ID") or "").strip()
-
-    if not api_key or not model_id:
-        return None, {"error": "MISSING_CONFIG", "required": ["ROBOFLOW_API_KEY", "ROBOFLOW_MODEL_ID"]}
-
-    if InferenceHTTPClient is None:
-        return None, {"error": "MISSING_DEPENDENCY", "required": "inference-sdk"}
-
-    image = cv2.imread(image_path)
-    if image is None:
-        return None, {"error": "IMAGE_READ_ERROR"}
-
+def _qr_candidate_regions(image: np.ndarray) -> list[np.ndarray]:
     h, w = image.shape[:2]
-    primary_threshold = _env_float("OMR_CORNER_CONFIDENCE", DEFAULT_CONFIDENCE_THRESHOLD)
-    fallback_threshold = _env_float("OMR_CORNER_CONFIDENCE_FALLBACK", DEFAULT_LOW_CONFIDENCE_THRESHOLD)
+    crops = [image]
 
-    client = InferenceHTTPClient(api_url="https://detect.roboflow.com", api_key=api_key)
+    # Printed sheets place the QR at the page's top-left. Include other corners
+    # so a rotated camera capture can still decode before/after normalization.
+    crop_specs = [
+        (0.00, 0.00, 0.42, 0.42),
+        (0.00, 0.58, 0.42, 1.00),
+        (0.58, 0.00, 1.00, 0.42),
+        (0.58, 0.58, 1.00, 1.00),
+        (0.00, 0.00, 0.55, 0.55),
+    ]
 
-    best_global = {}
-    best_score = -1.0
-    used_threshold = primary_threshold
-    used_variant = -1
+    for y1, x1, y2, x2 in crop_specs:
+        crop = image[int(h * y1):int(h * y2), int(w * x1):int(w * x2)]
+        if crop.size:
+            crops.append(crop)
 
-    for variant_idx, variant in enumerate(_build_inference_variants(image)):
-        temp_path = None
-        try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
-                temp_path = tmp.name
-            if not cv2.imwrite(temp_path, variant):
-                continue
-
-            result = client.infer(temp_path, model_id=model_id)
-            predictions = result.get("predictions", [])
-
-            selected = select_best_predictions(predictions, primary_threshold)
-            threshold_used = primary_threshold
-
-            if len(selected) < 4 and fallback_threshold < primary_threshold:
-                selected_fb = select_best_predictions(predictions, fallback_threshold)
-                if _score_selection(selected_fb) > _score_selection(selected):
-                    selected = selected_fb
-                    threshold_used = fallback_threshold
-
-            score = _score_selection(selected)
-            if score > best_score:
-                best_score = score
-                best_global = selected
-                used_threshold = threshold_used
-                used_variant = variant_idx
-
-            if len(best_global) >= 4:
-                break
-        finally:
-            if temp_path and os.path.exists(temp_path):
-                try:
-                    os.remove(temp_path)
-                except Exception:
-                    pass
-
-    if len(best_global) < 4:
-        recovered, recovered_ok = _recover_missing_corner(best_global, w, h)
-        if recovered_ok:
-            best_global = recovered
-
-    if len(best_global) < 4:
-        return None, {
-            "error": "INCOMPLETE_DETECTION",
-            "details": {
-                "detected_classes": sorted(list(best_global.keys())),
-                "threshold_used": used_threshold,
-                "variant_used": used_variant,
-            },
-        }
-
-    raw_pts = [center_from_prediction(best_global[name]) for name in REQUIRED_CLASSES]
-    ordered = order_points_clockwise(raw_pts)
-
-    min_area_ratio = _env_float("OMR_MIN_POLYGON_AREA_RATIO", DEFAULT_MIN_POLYGON_AREA_RATIO)
-    strong_corner_conf = _env_float("OMR_STRONG_CORNER_CONFIDENCE", DEFAULT_STRONG_CORNER_CONFIDENCE)
-    area = _polygon_area(ordered)
-    min_conf = _min_corner_confidence(best_global)
-
-    has_inferred_corner = any(bool(v.get("inferred")) for v in best_global.values())
-
-    # Only hard-fail small polygons when detections are weak or inferred.
-    # If all 4 real corners are detected, allow processing to continue.
-    if area < float(w * h) * min_area_ratio and (has_inferred_corner or min_conf < strong_corner_conf):
-        return None, {
-            "error": "INCOMPLETE_DETECTION",
-            "details": {
-                "reason": "SMALL_POLYGON",
-                "polygon_area": area,
-                "min_area": float(w * h) * min_area_ratio,
-                "min_corner_confidence": min_conf,
-                "strong_corner_confidence": strong_corner_conf,
-                "has_inferred_corner": has_inferred_corner,
-                "variant_used": used_variant,
-            },
-        }
-
-    return {
-        "corners": best_global,
-        "threshold_used": used_threshold,
-        "variant_used": used_variant,
-        "recovered_missing": any(bool(v.get("inferred")) for v in best_global.values()),
-    }, None
+    return crops
 
 
-def process_document_result(image_path):
+def decode_sheet_qr(*images: np.ndarray) -> str:
+    for image in images:
+        if image is None:
+            continue
+
+        rotations = [
+            image,
+            cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE),
+            cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE),
+            cv2.rotate(image, cv2.ROTATE_180),
+        ]
+
+        for rotated in rotations:
+            for region in _qr_candidate_regions(rotated):
+                for variant in _qr_variants(region):
+                    data = _decode_qr_with_pyzbar(variant) or _decode_qr_with_opencv(variant)
+                    if data:
+                        return data
+
+    return "UNKNOWN"
+
+
+def process_document_result(image_path: str) -> Dict:
     image = cv2.imread(image_path)
     if image is None:
         return {"error": "IMAGE_READ_ERROR"}
 
-    inference_pack, infer_error = run_inference_best(image_path)
-    if infer_error is not None:
-        return infer_error
-
-    best_by_class = inference_pack["corners"]
-
-    raw_pts = [center_from_prediction(best_by_class[name]) for name in REQUIRED_CLASSES]
-    ordered_pts = order_points_clockwise(raw_pts)
-
-    is_invalid, out_w, out_h = validate_angle_and_get_size(ordered_pts)
-    if is_invalid:
-        return {"error": "INVALID_ANGLE"}
-
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    output_dir = resolve_output_dir(script_dir)
+    output_dir = resolve_output_dir()
     os.makedirs(output_dir, exist_ok=True)
+    filename = os.path.basename(image_path)
+    root_name = os.path.splitext(filename)[0]
 
-    base_name = os.path.splitext(os.path.basename(image_path))[0]
-    preview_path = os.path.join(output_dir, f"{base_name}_preview.jpg")
-    warp_debug_path = os.path.join(output_dir, f"{base_name}_warp_debug.jpg")
-    processed_path = os.path.join(output_dir, f"{base_name}_processed.png")
+    # Step 1: Flatten Perspective Shape Map
+    warped_landscape, warp_meta = warp_sheet_to_landscape(image)
 
-    preview = draw_preview_polyline(image, ordered_pts)
-    cv2.imwrite(preview_path, preview)
+    # Step 2: Rotate to Portrait Orientation
+    portrait_image = cv2.rotate(warped_landscape, cv2.ROTATE_90_CLOCKWISE)
 
-    warped = warp_to_a4(image, ordered_pts, out_w, out_h)
-    cv2.imwrite(warp_debug_path, warped)
+    original_path = os.path.join(output_dir, f"debug_{root_name}_00_original.jpg")
+    perspective_path = os.path.join(output_dir, f"debug_{root_name}_02_perspective_warp.jpg")
+    cv2.imwrite(original_path, image)
+    cv2.imwrite(perspective_path, portrait_image)
 
-    processed = scanner_filter(warped)
-    cv2.imwrite(processed_path, processed)
+    # Step 3: QR Parsing
+    qr_data = decode_sheet_qr(image, warped_landscape, portrait_image)
 
-    bubble_input = cv2.cvtColor(processed, cv2.COLOR_GRAY2BGR)
-    bubble_result = analyze_bubbles(bubble_input, os.path.basename(processed_path))
-    if "error" in bubble_result:
-        return {"error": "BUBBLE_PROCESSING_FAILED", "details": bubble_result}
+    # Step 4: System Threshold Workspace
+    gray = cv2.cvtColor(portrait_image, cv2.COLOR_BGR2GRAY)
+    thresh_full = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 7
+    )
 
-    corner_debug = {
-        "required_order": REQUIRED_CLASSES,
-        "raw_by_class": {
-            cls: {
-                "x": float(best_by_class[cls]["x"]),
-                "y": float(best_by_class[cls]["y"]),
-                "confidence": float(best_by_class[cls].get("confidence", 0.0)),
-                "inferred": bool(best_by_class[cls].get("inferred", False)),
-            }
-            for cls in REQUIRED_CLASSES
-        },
-        "ordered_points": {
-            "top_left": [float(ordered_pts[0][0]), float(ordered_pts[0][1])],
-            "top_right": [float(ordered_pts[1][0]), float(ordered_pts[1][1])],
-            "bottom_right": [float(ordered_pts[2][0]), float(ordered_pts[2][1])],
-            "bottom_left": [float(ordered_pts[3][0]), float(ordered_pts[3][1])],
-        },
-        "variant_used": int(inference_pack.get("variant_used", -1)),
-        "threshold_used": float(inference_pack.get("threshold_used", DEFAULT_CONFIDENCE_THRESHOLD)),
-        "recovered_missing": bool(inference_pack.get("recovered_missing", False)),
+    # Step 5: Extract Outer Container Box Contour Coordinates Dynamically
+    contours, _ = cv2.findContours(thresh_full.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+
+    bx, by, bw, bh = 0, 0, portrait_image.shape[1], portrait_image.shape[0]
+    green_rect_visual = portrait_image.copy()
+
+    for c in contours:
+        x, y, w_box, h_box = cv2.boundingRect(c)
+        if w_box > (portrait_image.shape[1] * 0.4) and h_box > (portrait_image.shape[0] * 0.4):
+            bx, by, bw, bh = x, y, w_box, h_box
+            cv2.rectangle(green_rect_visual, (bx, by), (bx + bw, by + bh), (0, 255, 0), 3)
+            break
+
+    green_rect_path = os.path.join(output_dir, f"debug_{root_name}_01_green_rectangles.jpg")
+    cv2.imwrite(green_rect_path, green_rect_visual)
+
+    # Isolate sub-grid image workspace (Image 03 Context)
+    bubble_box_roi = thresh_full[by : by + bh, bx : bx + bw]
+    before_check_path = os.path.join(output_dir, f"debug_{root_name}_03_before_check_bubbles.jpg")
+    cv2.imwrite(before_check_path, bubble_box_roi)
+
+    # Step 6: Process Matrix evaluation inside CheckBubbles using Image 03 directly
+    bubble_result = CheckBubbles.analyze_bubbles(bubble_box_roi, filename)
+
+    # Step 7: Final Visual Overlay Rendering (04_after_check_bubbles)
+    after_bubbles_path = os.path.join(output_dir, f"debug_{root_name}_04_after_check_bubbles.jpg")
+    final_debug_visual = portrait_image.copy()
+    
+    if "bubble_centers" in bubble_result:
+        r_size = bubble_result.get("calculated_radius", 8)
+        
+        for center, is_filled, item_num_str in bubble_result["bubble_centers"]:
+            # Recalculate local sub-grid points back onto portrait view coordinates
+            cx = center[0] + bx
+            cy = center[1] + by
+            
+            # Draw tracking circle for every identified option node
+            cv2.circle(final_debug_visual, (cx, cy), r_size + 2, (0, 255, 0), 2)
+            
+            # Fill chosen bubble choices with a clean indicator marker
+            if is_filled:
+                cv2.circle(final_debug_visual, (cx, cy), int(r_size * 0.65), (0, 0, 255), -1)
+                
+    cv2.imwrite(after_bubbles_path, final_debug_visual)
+
+    debug_images = {
+        "original": _public_path(original_path, output_dir),
+        "green_rectangles": _public_path(green_rect_path, output_dir),
+        "perspective_warp": _public_path(perspective_path, output_dir),
+        "before_check_bubbles": _public_path(before_check_path, output_dir),
+        "after_check_bubbles": _public_path(after_bubbles_path, output_dir),
     }
 
     return {
-        "file": os.path.basename(image_path),
-        "processed_path": processed_path,
-        "preview_path": preview_path,
-        "warp_debug_path": warp_debug_path,
-        "bubble_preprocessed_path": bubble_result.get("preprocessed"),
-        "debug": bubble_result.get("debug"),
-        "sheet_id": bubble_result.get("sheet_id"),
+        "file": filename,
+        "sheet_id": qr_data,
         "answers": bubble_result.get("answers", {}),
-        "corner_debug": corner_debug,
+        "warp_debug_path": debug_images["perspective_warp"],
+        "debug": debug_images["after_check_bubbles"],
+        "debug_images": debug_images,
+        "warp_debug": warp_meta,
     }
 
 
-def detect_bubble_grid(img, filename):
+def detect_bubble_grid(img, filename: str = "") -> Dict:
+    if isinstance(img, (str, os.PathLike)):
+        return process_document_result(os.fspath(img))
+
     temp_path = None
     try:
         ext = os.path.splitext(filename or "capture.jpg")[1] or ".jpg"
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
             temp_path = tmp.name
-
-        if not cv2.imwrite(temp_path, img):
-            return {"error": "IMAGE_WRITE_ERROR"}
-
+        cv2.imwrite(temp_path, img)
         return process_document_result(temp_path)
     except Exception as exc:
-        return {"error": str(exc)}
+        return {"error": str(exc), "traceback": traceback.format_exc()}
     finally:
         if temp_path and os.path.exists(temp_path):
             try:
@@ -433,16 +295,10 @@ def detect_bubble_grid(img, filename):
 
 
 def main():
-    try:
-        if len(sys.argv) < 2:
-            print(json.dumps({"error": "NO_IMAGE_PATH"}))
-            return
-
-        result = process_document_result(sys.argv[1])
-        print(json.dumps(result))
-    except Exception:
-        print(json.dumps({"error": "PROCESSING_FAILED", "traceback": traceback.format_exc()}))
-        sys.exit(1)
+    if len(sys.argv) < 2:
+        print(json.dumps({"error": "NO_IMAGE_PATH"}))
+        return
+    print(json.dumps(process_document_result(sys.argv[1])))
 
 
 if __name__ == "__main__":
