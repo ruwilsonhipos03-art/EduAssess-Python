@@ -1,3 +1,5 @@
 .env
 .venv/
 __pycache__/
+omr/output/
+omr/**/__pycache__/

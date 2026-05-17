@@ -1,7 +1,6 @@
 import os
 import tempfile
 from typing import Callable, Optional
-
 import cv2
 import numpy as np
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile
@@ -9,173 +8,104 @@ from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 from CheckBubbles import detect_bubble_grid as detect_bubbles
 from CheckExam import detect_bubble_grid as detect_exam
 
+try:
+    from dotenv import load_dotenv
+except Exception:
+    load_dotenv = None
+
+if load_dotenv is not None:
+    load_dotenv()
 
 app = FastAPI(title="EduAssess OMR Service", version="1.0.0")
 
-
-def _order_points(points: np.ndarray) -> np.ndarray:
-    rect = np.zeros((4, 2), dtype="float32")
-
-    s = points.sum(axis=1)
-    rect[0] = points[np.argmin(s)]  # top-left
-    rect[2] = points[np.argmax(s)]  # bottom-right
-
-    diff = np.diff(points, axis=1)
-    rect[1] = points[np.argmin(diff)]  # top-right
-    rect[3] = points[np.argmax(diff)]  # bottom-left
-    return rect
-
-
-def _four_point_transform(image: np.ndarray, points: np.ndarray) -> np.ndarray:
-    rect = _order_points(points)
-    (tl, tr, br, bl) = rect
-
-    width_a = np.linalg.norm(br - bl)
-    width_b = np.linalg.norm(tr - tl)
-    max_width = max(int(width_a), int(width_b))
-
-    height_a = np.linalg.norm(tr - br)
-    height_b = np.linalg.norm(tl - bl)
-    max_height = max(int(height_a), int(height_b))
-
-    if max_width < 10 or max_height < 10:
-        return image
-
-    dst = np.array(
-        [
-            [0, 0],
-            [max_width - 1, 0],
-            [max_width - 1, max_height - 1],
-            [0, max_height - 1],
-        ],
-        dtype="float32",
-    )
-
-    matrix = cv2.getPerspectiveTransform(rect, dst)
-    return cv2.warpPerspective(image, matrix, (max_width, max_height))
-
-
-def _scan_preprocess(image: np.ndarray) -> np.ndarray:
-    """Try to flatten and crop a sheet-like contour, fallback to original image."""
-    original = image
-    height = image.shape[0]
-    scale = height / 500.0 if height > 0 else 1.0
-    resized = image if height <= 500 else cv2.resize(
-        image, (int(image.shape[1] / scale), 500), interpolation=cv2.INTER_AREA
-    )
-
-    gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blur, 75, 200)
-
-    contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:8]
-
-    page = None
-    for contour in contours:
-        peri = cv2.arcLength(contour, True)
-        approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
-        if len(approx) == 4:
-            page = approx.reshape(4, 2).astype("float32")
-            break
-
-    if page is None:
-        return original
-
-    warped = _four_point_transform(original, page * scale)
-
-    # Optional "scanned paper" black/white look if enabled.
-    if str(os.getenv("OMR_APPLY_SCAN_THRESHOLD", "0")).strip() in {"1", "true", "True"}:
-        warped_gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
-        bw = cv2.adaptiveThreshold(
-            warped_gray,
-            255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY,
-            11,
-            10,
-        )
-        return cv2.cvtColor(bw, cv2.COLOR_GRAY2BGR)
-
-    return warped
-
-
 def _require_api_key(x_api_key: Optional[str]) -> None:
-    expected = (os.getenv("OMR_API_KEY") or "").strip()
+    expected = (os.getenv("OMR_API_KEY") or os.getenv("OMR_API_BEARER_TOKEN") or "").strip()
     if not expected:
         return
     if x_api_key != expected:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-
-def _scan_uploaded_file(
-    upload: UploadFile,
-    detector: Callable[[cv2.typing.MatLike, str], dict],
-) -> dict:
+def _scan_uploaded_file_raw(upload: UploadFile, detector: Callable[[str], dict]) -> dict:
     filename = upload.filename or "upload.jpg"
     ext = os.path.splitext(filename)[1] or ".jpg"
     temp_path = None
 
     try:
+        # Read the raw byte data streamed from Laravel first
+        file_bytes = upload.file.read()
+        if not file_bytes:
+            raise ValueError("Received an empty file payload from Laravel.")
+
+        # Reconstruct the image matrix directly from memory for verification
+        nparr = np.frombuffer(file_bytes, np.uint8)
+        debug_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+        # --- DEBUG DUMP ---
+        if debug_img is not None:
+            cv2.imwrite("laravel_received_dump.jpg", debug_img)
+        else:
+            raise ValueError("Uploaded data could not be decoded into a valid image matrix.")
+        # ------------------
+
+        # Safely write to disk and close the file completely before passing to detector
+        # This resolves Windows file locking and un-flushed memory buffer issues.
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
             temp_path = tmp.name
-            tmp.write(upload.file.read())
+            tmp.write(file_bytes)
+            tmp.flush() # Ensure bytes are fully pushed to storage hardware
 
-        img = cv2.imread(temp_path)
-        if img is None:
-            raise HTTPException(status_code=400, detail="Cannot read image")
+        # Verify the file actually exists and has content before executing detector
+        if not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
+            raise FileNotFoundError(f"Temporary file write failed or file is empty at: {temp_path}")
 
-        processed = _scan_preprocess(img)
-        result = detector(processed, os.path.basename(temp_path))
-        return result
-    except HTTPException:
-        raise
+        # Now pass the path to your OMR scanner functions safely
+        return detector(temp_path)
+
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        # Capture and return the real underlying error trace back to Laravel
+        raise HTTPException(status_code=500, detail=f"OMR Python Error: {str(exc)}")
     finally:
         upload.file.close()
         if temp_path and os.path.exists(temp_path):
-            os.remove(temp_path)
-
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
 
 @app.get("/health")
 def health() -> dict:
     return {"ok": True}
 
-
 @app.post("/scan/exam")
-def scan_exam(
-    file: UploadFile = File(...),
-    x_api_key: Optional[str] = Header(default=None),
-) -> dict:
+def scan_exam(file: UploadFile = File(...), x_api_key: Optional[str] = Header(default=None)) -> dict:
     _require_api_key(x_api_key)
-    exam_result = _scan_uploaded_file(file, detect_exam)
+    return _scan_uploaded_file_raw(file, detect_exam)
 
-    # Run bubble-only pass automatically after exam detection.
-    # Reconstruct image from exam output path if available, otherwise fail softly.
-    processed_path = exam_result.get("processed_path")
-    if processed_path and os.path.exists(processed_path):
-        bubble_img = cv2.imread(processed_path)
-        if bubble_img is not None:
-            bubble_result = detect_bubbles(
-                bubble_img,
-                os.path.basename(processed_path),
-            )
-        else:
-            bubble_result = {"error": "Cannot read processed image for bubble pass"}
-    else:
-        bubble_result = {"error": "No processed image path returned by exam pass"}
-
-    return {
-        "exam": exam_result,
-        "check_bubbles": bubble_result,
-    }
-
+@app.post("/scan/bubbles")
+def scan_bubbles(file: UploadFile = File(...), x_api_key: Optional[str] = Header(default=None)) -> dict:
+    _require_api_key(x_api_key)
+    return _scan_uploaded_file_raw(file, detect_exam)
 
 @app.post("/api/entrance/omr/check")
-def scan_exam_laravel_alias(
-    file: UploadFile = File(...),
-    x_api_key: Optional[str] = Header(default=None),
-) -> dict:
-    """Compatibility alias for Laravel/frontend route expectations."""
+def scan_exam_laravel_alias(file: UploadFile = File(...), x_api_key: Optional[str] = Header(default=None)) -> dict:
     return scan_exam(file=file, x_api_key=x_api_key)
+
+@app.post("/api/omr/check-exam")
+def scan_exam_test_alias(file: UploadFile = File(...), x_api_key: Optional[str] = Header(default=None)) -> dict:
+    return scan_exam(file=file, x_api_key=x_api_key)
+
+@app.post("/scan/term")
+def scan_term(file: UploadFile = File(...), x_api_key: Optional[str] = Header(default=None)) -> dict:
+    return scan_exam(file=file, x_api_key=x_api_key)
+
+@app.post("/api/instructor/omr/check-term")
+def scan_term_laravel_alias(file: UploadFile = File(...), x_api_key: Optional[str] = Header(default=None)) -> dict:
+    return scan_term(file=file, x_api_key=x_api_key)
+
+@app.post("/api/omr/check-term")
+def scan_term_test_alias(file: UploadFile = File(...), x_api_key: Optional[str] = Header(default=None)) -> dict:
+    return scan_term(file=file, x_api_key=x_api_key)
+
+@app.post("/api/entrance/omr/check-bubbles")
+def scan_bubbles_laravel_alias(file: UploadFile = File(...), x_api_key: Optional[str] = Header(default=None)) -> dict:
+    return scan_bubbles(file=file, x_api_key=x_api_key)
